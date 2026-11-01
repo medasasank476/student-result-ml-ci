@@ -1,0 +1,101 @@
+
+name: Build, Test and Publish Student Result Prediction
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: student-result-ml
+
+jobs:
+  build-test-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate model artifact
+        run: python train_model.py
+
+      - name: Run ML tests
+        run: python -m unittest test_ml_pipeline.py -v
+
+      - name: Run API tests
+        run: python -m unittest test_app.py -v
+
+      - name: Build Docker image
+        run: docker build -t student-result-ml:ci .
+
+      - name: Start test container
+        run: |
+          docker run -d \
+            --name student-result-ci \
+            -p 5000:5000 \
+            student-result-ml:ci
+
+      - name: Test API health endpoint
+        run: |
+          for attempt in {1..20}; do
+            if curl --fail --silent http://localhost:5000/health; then
+              echo "Health check passed."
+              exit 0
+            fi
+            echo "Waiting for API... attempt $attempt"
+            sleep 3
+          done
+          echo "Health check failed."
+          docker logs student-result-ci
+          exit 1
+
+      - name: Test prediction endpoint
+        run: |
+          response=$(curl --fail --silent --show-error \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"attendance":90,"internal_marks":85,"assignment_marks":88,"previous_score":80}' \
+            http://localhost:5000/predict)
+          echo "Prediction response: $response"
+          echo "$response" | grep -q '"prediction":"PASS"'
+
+      - name: Remove test container
+        if: always()
+        run: docker rm -f student-result-ci || true
+
+      - name: Create lowercase GHCR image name
+        run: |
+          IMAGE_ID="${REGISTRY}/${{ github.repository_owner }}/${IMAGE_NAME}"
+          IMAGE_ID=$(echo "$IMAGE_ID" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE_ID=$IMAGE_ID" >> "$GITHUB_ENV"
+
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login $REGISTRY \
+            -u "${{ github.actor }}" \
+            --password-stdin
+
+      - name: Tag tested image
+        run: |
+          docker tag student-result-ml:ci $IMAGE_ID:latest
+          docker tag student-result-ml:ci $IMAGE_ID:sha-${{ github.sha }}
+
+      - name: Push tested image to GHCR
+        run: |
+          docker push $IMAGE_ID:latest
+          docker push $IMAGE_ID:sha-${{ github.sha }}
